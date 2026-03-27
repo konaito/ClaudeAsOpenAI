@@ -37,6 +37,7 @@ import logging
 import os
 import time
 import uuid
+from collections.abc import AsyncIterator
 from typing import Annotated, Any, Literal
 
 import uvicorn
@@ -224,40 +225,87 @@ class ModelListResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def convert_messages(messages: list[ChatMessage]) -> tuple[str | None, str]:
+def _convert_image_url_to_claude(part: dict) -> dict | None:
+    """OpenAI image_url content part → Claude image content block に変換。"""
+    try:
+        url = part["image_url"]["url"]
+    except (KeyError, TypeError):
+        logger.warning("不正な image_url パート: %s", part)
+        return None
+
+    if url.startswith("data:"):
+        # "data:image/jpeg;base64,/9j/4AAQ..."
+        try:
+            header, data = url.split(",", 1)
+            media_type = header.split(":")[1].split(";")[0]
+        except (ValueError, IndexError):
+            logger.warning("不正な data URL: %s", url[:80])
+            return None
+        return {
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": data},
+        }
+    else:
+        return {
+            "type": "image",
+            "source": {"type": "url", "url": url},
+        }
+
+
+def convert_messages(messages: list[ChatMessage]) -> tuple[str | None, str | list]:
     """OpenAI messages 配列 → (system_prompt, user_prompt) に変換。
 
     system/developer ロールは system_prompt に集約。
     user/assistant/tool ロールは会話形式のテキストに結合。
+    画像が含まれる場合、user_prompt は Claude content blocks のリストになる。
     """
     system_parts: list[str] = []
     conversation_parts: list[str] = []
+    image_blocks: list[dict] = []
 
     for msg in messages:
         content = msg.content
         if isinstance(content, list):
-            text_parts = [
-                p["text"]
-                for p in content
-                if isinstance(p, dict) and p.get("type") == "text"
-            ]
+            text_parts: list[str] = []
+            for p in content:
+                if not isinstance(p, dict):
+                    continue
+                if p.get("type") == "text":
+                    text_parts.append(p["text"])
+                elif p.get("type") == "image_url" and msg.role == "user":
+                    block = _convert_image_url_to_claude(p)
+                    if block:
+                        image_blocks.append(block)
             content = "\n".join(text_parts) if text_parts else ""
 
-        if not content:
+        if not content and not image_blocks:
             continue
 
         if msg.role in ("system", "developer"):
-            system_parts.append(content)
+            if content:
+                system_parts.append(content)
         elif msg.role == "user":
-            conversation_parts.append(f"User: {content}")
+            if content:
+                conversation_parts.append(f"User: {content}")
         elif msg.role == "assistant":
-            conversation_parts.append(f"Assistant: {content}")
+            if content:
+                conversation_parts.append(f"Assistant: {content}")
         elif msg.role == "tool":
-            conversation_parts.append(f"Tool result: {content}")
+            if content:
+                conversation_parts.append(f"Tool result: {content}")
 
     system_prompt = "\n\n".join(system_parts) if system_parts else None
-    user_prompt = "\n\n".join(conversation_parts) if conversation_parts else "Hello"
 
+    if image_blocks:
+        # 画像がある場合は Claude content blocks のリストとして返す
+        content_blocks: list[dict] = []
+        text = "\n\n".join(conversation_parts)
+        if text:
+            content_blocks.append({"type": "text", "text": text})
+        content_blocks.extend(image_blocks)
+        return system_prompt, content_blocks if content_blocks else "Hello"
+
+    user_prompt = "\n\n".join(conversation_parts) if conversation_parts else "Hello"
     return system_prompt, user_prompt
 
 
@@ -281,15 +329,40 @@ def _make_options(
 # ---------------------------------------------------------------------------
 
 
+async def _make_prompt(
+    user_prompt: str | list,
+) -> "str | AsyncIterator[dict[str, Any]]":
+    """user_prompt が list（画像含む）の場合は AsyncIterator に変換。
+
+    SDK の query() は str か AsyncIterable[dict] を受け付ける。
+    list content blocks を送るには AsyncIterable モードで
+    user message dict を直接送る。
+    """
+    if isinstance(user_prompt, str):
+        return user_prompt
+
+    # list の場合は AsyncIterable を返す
+    async def _stream() -> AsyncIterator[dict[str, Any]]:
+        yield {
+            "type": "user",
+            "message": {"role": "user", "content": user_prompt},
+            "parent_tool_use_id": None,
+            "session_id": "",
+        }
+
+    return _stream()
+
+
 async def call_claude(req: ChatCompletionRequest) -> str:
     """Claude Agent SDK でテキスト応答を取得（非ストリーミング）。"""
     from claude_agent_sdk import AssistantMessage, TextBlock, query
 
     system_prompt, user_prompt = convert_messages(req.messages)
     options = _make_options(req.model, system_prompt)
+    prompt = await _make_prompt(user_prompt)
 
     text_parts: list[str] = []
-    async for message in query(prompt=user_prompt, options=options):
+    async for message in query(prompt=prompt, options=options):
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, TextBlock):
@@ -304,13 +377,14 @@ async def stream_claude(req: ChatCompletionRequest):
 
     system_prompt, user_prompt = convert_messages(req.messages)
     options = _make_options(req.model, system_prompt)
+    prompt = await _make_prompt(user_prompt)
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
     # role チャンク
     yield _sse_chunk(completion_id, created, req.model, {"role": "assistant", "content": ""}, None)
 
-    async for message in query(prompt=user_prompt, options=options):
+    async for message in query(prompt=prompt, options=options):
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, TextBlock) and block.text:
