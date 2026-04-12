@@ -35,6 +35,7 @@ Claude モデルにアクセスできるプロキシサーバー。
 import json
 import logging
 import os
+import asyncio
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -42,10 +43,12 @@ from typing import Annotated, Any, Literal
 
 import uvicorn
 from fastapi import FastAPI, Header
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("claude-proxy")
+_CLAUDE_QUERY_MAX_ATTEMPTS = 2
+_CLAUDE_RETRY_BASE_DELAY_SEC = 0.25
 
 # ---------------------------------------------------------------------------
 # OpenAI 互換の型定義
@@ -220,6 +223,83 @@ class ModelListResponse(BaseModel):
     data: list[ModelInfo]
 
 
+class ClaudeProxyError(Exception):
+    """Claude SDK 起因のエラーを OpenAI 互換形式へ変換するための内部例外。"""
+
+    def __init__(self, status_code: int, message: str, error_type: str, code: str):
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+        self.error_type = error_type
+        self.code = code
+
+    def to_openai_error(self) -> dict[str, Any]:
+        return {
+            "error": {
+                "message": self.message,
+                "type": self.error_type,
+                "code": self.code,
+            }
+        }
+
+
+def _compact_exception_text(exc: Exception, *, max_lines: int = 8, max_chars: int = 1200) -> str:
+    """例外メッセージを API レスポンス向けに短く整形。"""
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()]
+    if not lines:
+        return exc.__class__.__name__
+    text = "\n".join(lines[:max_lines])
+    if len(text) > max_chars:
+        return f"{text[:max_chars]}..."
+    return text
+
+
+def _is_retryable_claude_error(exc: Exception) -> bool:
+    """一時的な CLI 失敗として再試行可能かを判定。"""
+    message = str(exc).lower()
+    retry_markers = (
+        "command failed with exit code",
+        "cannot write to process that exited",
+        "broken pipe",
+    )
+    return any(marker in message for marker in retry_markers)
+
+
+def _to_claude_proxy_error(exc: Exception) -> ClaudeProxyError:
+    """SDK 例外を HTTP ステータスと OpenAI 互換エラーへマップ。"""
+    from claude_agent_sdk import CLIConnectionError, CLINotFoundError, ProcessError
+
+    detail = _compact_exception_text(exc)
+
+    if isinstance(exc, CLINotFoundError):
+        return ClaudeProxyError(
+            status_code=503,
+            message="Claude Code CLI is not installed or not available on PATH.",
+            error_type="service_unavailable",
+            code="claude_cli_not_found",
+        )
+    if isinstance(exc, CLIConnectionError):
+        return ClaudeProxyError(
+            status_code=503,
+            message=f"Failed to connect to Claude Code CLI.\n{detail}",
+            error_type="service_unavailable",
+            code="claude_cli_connection_failed",
+        )
+    if isinstance(exc, ProcessError) or "command failed with exit code" in detail.lower():
+        return ClaudeProxyError(
+            status_code=502,
+            message=f"Claude Code CLI process failed.\n{detail}",
+            error_type="server_error",
+            code="claude_cli_process_failed",
+        )
+    return ClaudeProxyError(
+        status_code=500,
+        message=f"Claude backend request failed.\n{detail}",
+        error_type="server_error",
+        code="claude_backend_failed",
+    )
+
+
 # ---------------------------------------------------------------------------
 # messages 変換
 # ---------------------------------------------------------------------------
@@ -361,14 +441,33 @@ async def call_claude(req: ChatCompletionRequest) -> str:
     options = _make_options(req.model, system_prompt)
     prompt = await _make_prompt(user_prompt)
 
-    text_parts: list[str] = []
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    text_parts.append(block.text)
+    last_error: Exception | None = None
+    for attempt in range(1, _CLAUDE_QUERY_MAX_ATTEMPTS + 1):
+        text_parts: list[str] = []
+        try:
+            async for message in query(prompt=prompt, options=options):
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            text_parts.append(block.text)
+            return "\n".join(text_parts) if text_parts else ""
+        except Exception as exc:
+            last_error = exc
+            if attempt < _CLAUDE_QUERY_MAX_ATTEMPTS and _is_retryable_claude_error(exc):
+                logger.warning(
+                    "Claude query failed on attempt %s/%s; retrying. error=%s",
+                    attempt,
+                    _CLAUDE_QUERY_MAX_ATTEMPTS,
+                    _compact_exception_text(exc),
+                )
+                await asyncio.sleep(_CLAUDE_RETRY_BASE_DELAY_SEC * attempt)
+                continue
+            logger.exception("Claude query failed")
+            raise _to_claude_proxy_error(exc) from exc
 
-    return "\n".join(text_parts) if text_parts else ""
+    if last_error is not None:
+        raise _to_claude_proxy_error(last_error) from last_error
+    return ""
 
 
 async def stream_claude(req: ChatCompletionRequest):
@@ -384,11 +483,18 @@ async def stream_claude(req: ChatCompletionRequest):
     # role チャンク
     yield _sse_chunk(completion_id, created, req.model, {"role": "assistant", "content": ""}, None)
 
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock) and block.text:
-                    yield _sse_chunk(completion_id, created, req.model, {"content": block.text}, None)
+    try:
+        async for message in query(prompt=prompt, options=options):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock) and block.text:
+                        yield _sse_chunk(completion_id, created, req.model, {"content": block.text}, None)
+    except Exception as exc:
+        logger.exception("Claude streaming query failed")
+        proxy_error = _to_claude_proxy_error(exc)
+        yield f"data: {json.dumps(proxy_error.to_openai_error())}\n\n"
+        yield "data: [DONE]\n\n"
+        return
 
     # 終了
     yield _sse_chunk(completion_id, created, req.model, {}, "stop")
@@ -547,7 +653,10 @@ async def chat_completions(
             },
         )
 
-    text = await call_claude(req)
+    try:
+        text = await call_claude(req)
+    except ClaudeProxyError as exc:
+        return JSONResponse(status_code=exc.status_code, content=exc.to_openai_error())
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
     return ChatCompletionResponse(
