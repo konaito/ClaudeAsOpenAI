@@ -130,6 +130,12 @@ HTTP(S) URL の画像もそのまま渡せる。
 - **一部パラメータ無視** — `temperature`, `top_p`, `stop` 等は受け付けるが Claude 側では無視される
 - **ツール制限** — 安全のため Bash, Write, Edit 等の破壊的ツールは無効化済み
 
+## 環境変数
+
+| 変数 | デフォルト | 説明 |
+| --- | --- | --- |
+| `CAS_MAX_CONCURRENT_QUERIES` | `8` | SDK サブプロセスの同時起動数上限。リクエストごとに Claude Code CLI の子プロセスが立つため、並行数が多すぎると OS の fd 上限（`ulimit -n`）を超えて `EMFILE` で失敗する。高トラフィック時は `ulimit -n` を上げつつこの値も調整する |
+
 ## ライセンス
 
 MIT

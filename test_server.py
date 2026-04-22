@@ -471,6 +471,91 @@ async def _async_noop(*_a, **_kw):
 
 
 # ---------------------------------------------------------------------------
+# SDK サブプロセス並行上限（Semaphore）
+# ---------------------------------------------------------------------------
+
+
+def test_sdk_semaphore_serializes_concurrent_sdk_calls():
+    """Semaphore=1 のとき、並行 call_claude は同時に SDK query() を実行しない。
+
+    fd 上限 (EMFILE) を突破しないための直列化が効いているかを検証する。
+    """
+    active = 0
+    max_observed = 0
+
+    def _query(prompt, options):  # noqa: ARG001
+        async def _gen():
+            nonlocal active, max_observed
+            active += 1
+            max_observed = max(max_observed, active)
+            try:
+                # 擬似的な SDK 処理時間。並行呼び出しがあれば重なる時間帯を作る。
+                await asyncio.sleep(0.01)
+                yield _FakeAssistantMessage("ok")
+            finally:
+                active -= 1
+
+        return _gen()
+
+    original_sem = server._sdk_semaphore
+    server._sdk_semaphore = asyncio.Semaphore(1)
+    try:
+        with _patch_sdk(_query):
+            req = ChatCompletionRequest(
+                model="sonnet",
+                messages=[ChatMessage(role="user", content="hi")],
+            )
+
+            async def _run():
+                return await asyncio.gather(*[call_claude(req) for _ in range(5)])
+
+            results = asyncio.run(_run())
+    finally:
+        server._sdk_semaphore = original_sem
+
+    assert all(r == "ok" for r in results)
+    assert max_observed == 1, f"並行実行が検出された: max {max_observed}"
+
+
+def test_sdk_semaphore_allows_concurrency_up_to_limit():
+    """Semaphore=3 のとき、5 並行でも同時実行数は 3 を超えない。"""
+    active = 0
+    max_observed = 0
+
+    def _query(prompt, options):  # noqa: ARG001
+        async def _gen():
+            nonlocal active, max_observed
+            active += 1
+            max_observed = max(max_observed, active)
+            try:
+                await asyncio.sleep(0.01)
+                yield _FakeAssistantMessage("ok")
+            finally:
+                active -= 1
+
+        return _gen()
+
+    original_sem = server._sdk_semaphore
+    server._sdk_semaphore = asyncio.Semaphore(3)
+    try:
+        with _patch_sdk(_query):
+            req = ChatCompletionRequest(
+                model="sonnet",
+                messages=[ChatMessage(role="user", content="hi")],
+            )
+
+            async def _run():
+                return await asyncio.gather(*[call_claude(req) for _ in range(5)])
+
+            asyncio.run(_run())
+    finally:
+        server._sdk_semaphore = original_sem
+
+    assert max_observed <= 3, f"上限を超えた並行実行: max {max_observed}"
+    assert max_observed >= 2, f"直列化され過ぎ（Semaphore が効いていない疑い）: max {max_observed}"
+
+
+# ---------------------------------------------------------------------------
 # stream_claude（SSE）
 # ---------------------------------------------------------------------------
 
