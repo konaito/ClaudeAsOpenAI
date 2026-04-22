@@ -364,12 +364,18 @@ def _convert_image_url_to_claude(part: dict) -> dict | None:
         }
 
 
-def convert_messages(messages: list[ChatMessage]) -> tuple[str | None, str | list]:
-    """OpenAI messages 配列 → (system_prompt, user_prompt) に変換。
+def convert_messages(
+    messages: list[ChatMessage],
+) -> tuple[str | None, list[dict]]:
+    """OpenAI messages 配列 → (system_prompt, user_content_blocks) に変換。
 
-    system/developer ロールは system_prompt に集約。
-    user/assistant/tool ロールは会話形式のテキストに結合。
-    画像が含まれる場合、user_prompt は Claude content blocks のリストになる。
+    user_content_blocks は常に Claude content blocks のリスト。
+
+    - system/developer ロールは system_prompt に集約
+    - user/assistant/tool ロールは会話形式に平坦化して 1 つの text block に集約
+      （SDK の query() は assistant ロール message を送れないため）
+    - user ロールの image_url は image block として追加
+    - 入力が空の場合は [{"type": "text", "text": "Hello"}] を返す
     """
     system_parts: list[str] = []
     conversation_parts: list[str] = []
@@ -390,35 +396,29 @@ def convert_messages(messages: list[ChatMessage]) -> tuple[str | None, str | lis
                         image_blocks.append(block)
             content = "\n".join(text_parts) if text_parts else ""
 
-        if not content and not image_blocks:
+        if not content:
             continue
 
         if msg.role in ("system", "developer"):
-            if content:
-                system_parts.append(content)
+            system_parts.append(content)
         elif msg.role == "user":
-            if content:
-                conversation_parts.append(f"User: {content}")
+            conversation_parts.append(f"User: {content}")
         elif msg.role == "assistant":
-            if content:
-                conversation_parts.append(f"Assistant: {content}")
+            conversation_parts.append(f"Assistant: {content}")
         elif msg.role == "tool":
-            if content:
-                conversation_parts.append(f"Tool result: {content}")
+            conversation_parts.append(f"Tool result: {content}")
 
     system_prompt = "\n\n".join(system_parts) if system_parts else None
 
-    if image_blocks:
-        # 画像がある場合は Claude content blocks のリストとして返す
-        content_blocks: list[dict] = []
-        text = "\n\n".join(conversation_parts)
-        if text:
-            content_blocks.append({"type": "text", "text": text})
-        content_blocks.extend(image_blocks)
-        return system_prompt, content_blocks if content_blocks else "Hello"
+    content_blocks: list[dict] = []
+    text = "\n\n".join(conversation_parts)
+    if text:
+        content_blocks.append({"type": "text", "text": text})
+    content_blocks.extend(image_blocks)
+    if not content_blocks:
+        content_blocks.append({"type": "text", "text": "Hello"})
 
-    user_prompt = "\n\n".join(conversation_parts) if conversation_parts else "Hello"
-    return system_prompt, user_prompt
+    return system_prompt, content_blocks
 
 
 def _make_options(
@@ -430,6 +430,7 @@ def _make_options(
     return ClaudeAgentOptions(
         model=model if model != "default" else None,
         system_prompt=system_prompt,
+        # one-shot 動作を強制。tool use ループや追加ターンが発生しないようにする。
         max_turns=1,
         cwd=os.path.expanduser("~"),
         disallowed_tools=["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"],
@@ -442,22 +443,21 @@ def _make_options(
 
 
 async def _make_prompt(
-    user_prompt: str | list,
+    content_blocks: list[dict],
 ) -> "str | AsyncIterator[dict[str, Any]]":
-    """user_prompt が list（画像含む）の場合は AsyncIterator に変換。
+    """Content blocks を SDK の query() プロンプト引数に変換する。
 
-    SDK の query() は str か AsyncIterable[dict] を受け付ける。
-    list content blocks を送るには AsyncIterable モードで
-    user message dict を直接送る。
+    SDK の query() は `str | AsyncIterable[dict]` を受け付ける。
+    - text 1 件のみ → str で渡す（軽量経路、既存テキスト専用クライアントと互換）
+    - それ以外（image 含む / 複数 block） → AsyncIterable で user message dict を yield
     """
-    if isinstance(user_prompt, str):
-        return user_prompt
+    if len(content_blocks) == 1 and content_blocks[0].get("type") == "text":
+        return content_blocks[0]["text"]
 
-    # list の場合は AsyncIterable を返す
     async def _stream() -> AsyncIterator[dict[str, Any]]:
         yield {
             "type": "user",
-            "message": {"role": "user", "content": user_prompt},
+            "message": {"role": "user", "content": content_blocks},
             "parent_tool_use_id": None,
             "session_id": "",
         }
@@ -469,14 +469,14 @@ async def call_claude(req: ChatCompletionRequest) -> str:
     """Claude Agent SDK でテキスト応答を取得（非ストリーミング）。"""
     from claude_agent_sdk import AssistantMessage, TextBlock, query
 
-    system_prompt, user_prompt = convert_messages(req.messages)
+    system_prompt, content_blocks = convert_messages(req.messages)
     options = _make_options(req.model, system_prompt)
 
     last_error: Exception | None = None
     for attempt in range(1, _CLAUDE_QUERY_MAX_ATTEMPTS + 1):
         text_parts: list[str] = []
         # AsyncIterable プロンプトは 1 回で消費されるため、再試行ごとに作り直す。
-        prompt = await _make_prompt(user_prompt)
+        prompt = await _make_prompt(content_blocks)
         try:
             async for message in query(prompt=prompt, options=options):
                 if isinstance(message, AssistantMessage):
@@ -503,33 +503,101 @@ async def call_claude(req: ChatCompletionRequest) -> str:
     return ""
 
 
-async def stream_claude(req: ChatCompletionRequest):
-    """Claude Agent SDK で SSE ストリーミング応答を生成。"""
-    from claude_agent_sdk import AssistantMessage, TextBlock, query
+def _emit_assistant_text_chunks(
+    message: Any,
+    completion_id: str,
+    created: int,
+    model: str,
+) -> list[str]:
+    """AssistantMessage から SSE content chunk を組み立てる。"""
+    from claude_agent_sdk import AssistantMessage, TextBlock
 
-    system_prompt, user_prompt = convert_messages(req.messages)
+    chunks: list[str] = []
+    if isinstance(message, AssistantMessage):
+        for block in message.content:
+            if isinstance(block, TextBlock) and block.text:
+                chunks.append(
+                    _sse_chunk(completion_id, created, model, {"content": block.text}, None)
+                )
+    return chunks
+
+
+async def stream_claude(req: ChatCompletionRequest):
+    """Claude Agent SDK で SSE ストリーミング応答を生成。
+
+    yield 前にリトライループを回す: 「初回 query() の接続〜最初の SDK message 取得まで」
+    を一時失敗のリトライ対象とする。最初の message を取得した後は真のストリーミングに
+    切り替わり、途中で失敗した場合は error chunk を 1 度 yield して終了する
+    （既に送ったトークンは巻き戻せないため）。
+    """
+    from claude_agent_sdk import query
+
+    system_prompt, content_blocks = convert_messages(req.messages)
     options = _make_options(req.model, system_prompt)
-    prompt = await _make_prompt(user_prompt)
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
-    # role チャンク
-    yield _sse_chunk(completion_id, created, req.model, {"role": "assistant", "content": ""}, None)
+    # --- Phase 1: 初回接続〜最初の SDK message までのリトライ ---
+    stream_iter = None
+    first_message: Any = None
+    has_first = False
+    last_error: Exception | None = None
 
+    for attempt in range(1, _CLAUDE_QUERY_MAX_ATTEMPTS + 1):
+        try:
+            prompt = await _make_prompt(content_blocks)
+            iterator = query(prompt=prompt, options=options).__aiter__()
+            try:
+                first_message = await iterator.__anext__()
+                has_first = True
+            except StopAsyncIteration:
+                # 空応答（message が一つも来ない）も成功扱いにする
+                has_first = False
+            stream_iter = iterator
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt < _CLAUDE_QUERY_MAX_ATTEMPTS and _is_retryable_claude_error(exc):
+                logger.warning(
+                    "Claude streaming query failed on attempt %s/%s; retrying. error=%s",
+                    attempt,
+                    _CLAUDE_QUERY_MAX_ATTEMPTS,
+                    _compact_exception_text(exc),
+                )
+                await asyncio.sleep(_CLAUDE_RETRY_BASE_DELAY_SEC * attempt)
+                continue
+            logger.exception("Claude streaming query failed")
+            proxy_error = _to_claude_proxy_error(exc)
+            yield f"data: {json.dumps(proxy_error.to_openai_error())}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+    if stream_iter is None:
+        proxy_error = _to_claude_proxy_error(last_error or RuntimeError("unknown"))
+        yield f"data: {json.dumps(proxy_error.to_openai_error())}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
+    # --- Phase 2: 実ストリーム。途中失敗はエラーチャンクで打ち切り ---
+    yield _sse_chunk(completion_id, created, req.model, {"role": "assistant", "content": ""}, None)
     try:
-        async for message in query(prompt=prompt, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock) and block.text:
-                        yield _sse_chunk(completion_id, created, req.model, {"content": block.text}, None)
+        if has_first:
+            for chunk in _emit_assistant_text_chunks(
+                first_message, completion_id, created, req.model
+            ):
+                yield chunk
+        async for message in stream_iter:
+            for chunk in _emit_assistant_text_chunks(
+                message, completion_id, created, req.model
+            ):
+                yield chunk
     except Exception as exc:
-        logger.exception("Claude streaming query failed")
+        logger.exception("Claude streaming mid-stream failure")
         proxy_error = _to_claude_proxy_error(exc)
         yield f"data: {json.dumps(proxy_error.to_openai_error())}\n\n"
         yield "data: [DONE]\n\n"
         return
 
-    # 終了
     yield _sse_chunk(completion_id, created, req.model, {}, "stop")
     yield "data: [DONE]\n\n"
 
@@ -557,27 +625,44 @@ def _sse_chunk(
 # ---------------------------------------------------------------------------
 
 _cached_models: list[dict[str, Any]] | None = None
+_models_fetch_lock: asyncio.Lock | None = None
+
+
+def _get_models_fetch_lock() -> asyncio.Lock:
+    """asyncio.Lock は event loop を必要とするため遅延生成する。"""
+    global _models_fetch_lock
+    if _models_fetch_lock is None:
+        _models_fetch_lock = asyncio.Lock()
+    return _models_fetch_lock
 
 
 async def _fetch_models() -> list[dict[str, Any]]:
-    """Claude Code CLI から利用可能なモデル一覧を取得してキャッシュ。"""
+    """Claude Code CLI から利用可能なモデル一覧を取得してキャッシュ。
+
+    並行リクエストが同時にコールドスタートしても、ClaudeSDKClient の起動は 1 度に絞る。
+    """
     global _cached_models
     if _cached_models is not None:
         return _cached_models
 
-    from claude_agent_sdk import ClaudeSDKClient
+    async with _get_models_fetch_lock():
+        # ロック取得後に再確認（double-checked locking）
+        if _cached_models is not None:
+            return _cached_models
 
-    try:
-        async with ClaudeSDKClient() as client:
-            info = await client.get_server_info()
-            if info and "models" in info:
-                _cached_models = info["models"]
-                return _cached_models
-    except Exception as e:
-        logger.warning(f"Failed to fetch models from CLI: {e}")
+        from claude_agent_sdk import ClaudeSDKClient
 
-    _cached_models = []
-    return _cached_models
+        try:
+            async with ClaudeSDKClient() as client:
+                info = await client.get_server_info()
+                if info and "models" in info:
+                    _cached_models = info["models"]
+                    return _cached_models
+        except Exception as e:
+            logger.warning(f"Failed to fetch models from CLI: {e}")
+
+        _cached_models = []
+        return _cached_models
 
 
 # ---------------------------------------------------------------------------

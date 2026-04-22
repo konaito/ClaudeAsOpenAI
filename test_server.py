@@ -55,6 +55,13 @@ def _image_url_part(url: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _sole_text(blocks: list[dict]) -> str:
+    """1 件の text block のみの想定で text を取り出す。"""
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "text"
+    return blocks[0]["text"]
+
+
 def test_convert_messages_basic():
     msgs = [
         ChatMessage(role="system", content="sys1"),
@@ -64,9 +71,10 @@ def test_convert_messages_basic():
     ]
     sysp, userp = convert_messages(msgs)
     assert sysp == "sys1"
-    assert "User: hi" in userp
-    assert "Assistant: hello" in userp
-    assert "User: how are you?" in userp
+    text = _sole_text(userp)
+    assert "User: hi" in text
+    assert "Assistant: hello" in text
+    assert "User: how are you?" in text
 
 
 def test_convert_messages_multiple_systems_joined():
@@ -77,14 +85,14 @@ def test_convert_messages_multiple_systems_joined():
     ]
     sysp, userp = convert_messages(msgs)
     assert sysp == "a\n\nb"
-    assert userp == "User: q"
+    assert _sole_text(userp) == "User: q"
 
 
 def test_convert_messages_empty_user_fallback():
     msgs = [ChatMessage(role="system", content="only system")]
     sysp, userp = convert_messages(msgs)
     assert sysp == "only system"
-    assert userp == "Hello"
+    assert _sole_text(userp) == "Hello"
 
 
 def test_convert_messages_multimodal_text_part():
@@ -96,7 +104,7 @@ def test_convert_messages_multimodal_text_part():
     ]
     sysp, userp = convert_messages(msgs)
     assert sysp is None
-    assert "what is this?" in userp
+    assert "what is this?" in _sole_text(userp)
 
 
 def test_convert_messages_image_produces_blocks():
@@ -177,10 +185,10 @@ def test_convert_messages_image_in_assistant_role_ignored():
         ),
     ]
     _, userp = convert_messages(msgs)
-    # 画像が assistant にしかなければ blocks に昇格しない → str のまま
-    assert isinstance(userp, str)
-    assert "User: look" in userp
-    assert "Assistant: ok" in userp
+    # 画像が assistant にしかなければ image block は作られず、text 1 件のみ
+    text = _sole_text(userp)
+    assert "User: look" in text
+    assert "Assistant: ok" in text
 
 
 def test_convert_messages_images_across_multiple_user_messages():
@@ -220,13 +228,18 @@ def test_convert_messages_images_across_multiple_user_messages():
 # ---------------------------------------------------------------------------
 
 
-def test_make_prompt_string_passthrough():
-    result = asyncio.run(_make_prompt("hello"))
+def test_make_prompt_single_text_block_returns_str():
+    """text block 1 件のみなら str 経路に寄せる。"""
+    result = asyncio.run(_make_prompt([{"type": "text", "text": "hello"}]))
     assert result == "hello"
 
 
-def test_make_prompt_list_returns_async_iterator():
-    blocks = [{"type": "text", "text": "x"}]
+def test_make_prompt_multi_block_returns_async_iterator():
+    """image を含む場合など複数 block は AsyncIterable 経路。"""
+    blocks = [
+        {"type": "text", "text": "look"},
+        {"type": "image", "source": {"type": "url", "url": "x"}},
+    ]
 
     async def _collect():
         stream = await _make_prompt(blocks)
@@ -240,6 +253,19 @@ def test_make_prompt_list_returns_async_iterator():
     msg = items[0]
     assert msg["type"] == "user"
     assert msg["message"]["content"] == blocks
+
+
+def test_make_prompt_non_text_single_block_returns_async_iterator():
+    """text 以外の block 1 件なら AsyncIterable（str に丸められない）。"""
+    blocks = [{"type": "image", "source": {"type": "url", "url": "x"}}]
+
+    async def _collect():
+        stream = await _make_prompt(blocks)
+        return [item async for item in stream]
+
+    items = asyncio.run(_collect())
+    assert len(items) == 1
+    assert items[0]["message"]["content"] == blocks
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +550,73 @@ def test_stream_claude_with_image_passes_blocks_to_sdk():
     assert isinstance(captured, list)
     content = captured[0]["message"]["content"]
     assert any(b["type"] == "image" for b in content)
+
+
+def test_stream_claude_retries_on_retryable_error_before_first_yield():
+    """初回 query() の接続失敗が retryable なら、2 回目で成功して通常ストリームを返す。
+
+    call_claude と同等のリトライ経路が stream_claude にも存在することの検証。
+    """
+    query_fn, calls = _make_query_fn(
+        [Exception("Command failed with exit code 1"), "recovered"]
+    )
+
+    async def _collect():
+        req = ChatCompletionRequest(
+            model="sonnet",
+            messages=[ChatMessage(role="user", content="hi")],
+            stream=True,
+        )
+        return [c async for c in stream_claude(req)]
+
+    with _patch_sdk(query_fn), patch("server.asyncio.sleep", new=_async_noop):
+        chunks = asyncio.run(_collect())
+
+    assert calls["n"] == 2
+    assert any("recovered" in c for c in chunks)
+    assert chunks[-1] == "data: [DONE]\n\n"
+    # エラーチャンクは出ていないこと
+    assert not any('"error"' in c for c in chunks)
+
+
+def test_stream_claude_retries_on_initialize_timeout():
+    """initialize timeout も yield 前なのでリトライされる。"""
+    query_fn, calls = _make_query_fn(
+        [Exception("Control request timeout: initialize"), "recovered"]
+    )
+
+    async def _collect():
+        req = ChatCompletionRequest(
+            model="sonnet",
+            messages=[ChatMessage(role="user", content="hi")],
+            stream=True,
+        )
+        return [c async for c in stream_claude(req)]
+
+    with _patch_sdk(query_fn), patch("server.asyncio.sleep", new=_async_noop):
+        chunks = asyncio.run(_collect())
+
+    assert calls["n"] == 2
+    assert any("recovered" in c for c in chunks)
+
+
+def test_stream_claude_no_retry_on_non_retryable_error():
+    """non-retryable エラー（RuntimeError 等）はリトライせず即エラーチャンク。"""
+    query_fn, calls = _make_query_fn([RuntimeError("boom")])
+
+    async def _collect():
+        req = ChatCompletionRequest(
+            model="sonnet",
+            messages=[ChatMessage(role="user", content="hi")],
+            stream=True,
+        )
+        return [c async for c in stream_claude(req)]
+
+    with _patch_sdk(query_fn):
+        chunks = asyncio.run(_collect())
+
+    assert calls["n"] == 1
+    assert any('"error"' in c for c in chunks)
 
 
 # ---------------------------------------------------------------------------
