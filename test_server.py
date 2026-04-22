@@ -45,6 +45,11 @@ from server import (
 )
 
 
+def _image_url_part(url: str) -> dict:
+    """OpenAI 互換の image_url content part を組み立てる。"""
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
 # ---------------------------------------------------------------------------
 # convert_messages
 # ---------------------------------------------------------------------------
@@ -100,12 +105,7 @@ def test_convert_messages_image_produces_blocks():
             role="user",
             content=[
                 {"type": "text", "text": "describe"},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": "data:image/png;base64,AAAA"
-                    },
-                },
+                _image_url_part("data:image/png;base64,AAAA"),
             ],
         )
     ]
@@ -125,12 +125,7 @@ def test_convert_messages_image_url_http():
     msgs = [
         ChatMessage(
             role="user",
-            content=[
-                {
-                    "type": "image_url",
-                    "image_url": {"url": "https://example.com/x.png"},
-                }
-            ],
+            content=[_image_url_part("https://example.com/x.png")],
         )
     ]
     _, userp = convert_messages(msgs)
@@ -150,14 +145,8 @@ def test_convert_messages_multiple_images_preserved():
             role="user",
             content=[
                 {"type": "text", "text": "compare"},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": "data:image/png;base64,AAA"},
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {"url": "https://example.com/b.png"},
-                },
+                _image_url_part("data:image/png;base64,AAA"),
+                _image_url_part("https://example.com/b.png"),
             ],
         )
     ]
@@ -183,10 +172,7 @@ def test_convert_messages_image_in_assistant_role_ignored():
             role="assistant",
             content=[
                 {"type": "text", "text": "ok"},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": "data:image/png;base64,AAA"},
-                },
+                _image_url_part("data:image/png;base64,AAA"),
             ],
         ),
     ]
@@ -203,10 +189,7 @@ def test_convert_messages_images_across_multiple_user_messages():
             role="user",
             content=[
                 {"type": "text", "text": "first"},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": "data:image/png;base64,AAA"},
-                },
+                _image_url_part("data:image/png;base64,AAA"),
             ],
         ),
         ChatMessage(role="assistant", content="got it"),
@@ -214,10 +197,7 @@ def test_convert_messages_images_across_multiple_user_messages():
             role="user",
             content=[
                 {"type": "text", "text": "second"},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": "data:image/png;base64,BBB"},
-                },
+                _image_url_part("data:image/png;base64,BBB"),
             ],
         ),
     ]
@@ -352,29 +332,11 @@ class _FakeTextBlock:
 
 
 def _make_query_fn(outputs):
-    """outputs: list of either str (成功テキスト) or Exception (投げる)。"""
-    calls = {"n": 0}
+    """outputs: list of either str (成功テキスト) or Exception (投げる)。
 
-    def _query(prompt, options):  # noqa: ARG001
-        idx = calls["n"]
-        calls["n"] += 1
-        item = outputs[idx]
-
-        async def _gen():
-            if isinstance(item, Exception):
-                raise item
-            yield _FakeAssistantMessage(item)
-
-        return _gen()
-
-    return _query, calls
-
-
-def _make_capturing_query_fn(outputs):
-    """_make_query_fn と同じだが、query() に渡された prompt を記録する。
-
-    AsyncIterable の場合は消費して list として保存するため、SDK に
-    実際に届く user message dict を検証できる。
+    calls["n"]       -- query() が呼ばれた回数
+    calls["prompts"] -- query() に渡された prompt。
+                        AsyncIterable の場合は消費して list として保存する。
     """
     calls = {"n": 0, "prompts": []}
 
@@ -533,7 +495,7 @@ def test_stream_claude_emits_error_payload():
 
 
 def test_stream_claude_with_image_passes_blocks_to_sdk():
-    query_fn, calls = _make_capturing_query_fn(["streamed"])
+    query_fn, calls = _make_query_fn(["streamed"])
 
     async def _collect():
         req = ChatCompletionRequest(
@@ -543,10 +505,7 @@ def test_stream_claude_with_image_passes_blocks_to_sdk():
                     role="user",
                     content=[
                         {"type": "text", "text": "what's this?"},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": "data:image/png;base64,AAA"},
-                        },
+                        _image_url_part("data:image/png;base64,AAA"),
                     ],
                 )
             ],
@@ -618,7 +577,7 @@ def test_chat_completions_error_maps_to_status():
 
 def test_chat_completions_image_reaches_sdk_as_base64_block():
     """OpenAI image_url (data URL) を投げたとき、SDK に base64 image block が届くこと。"""
-    query_fn, calls = _make_capturing_query_fn(["described"])
+    query_fn, calls = _make_query_fn(["described"])
     with _patch_sdk(query_fn):
         client = TestClient(app)
         r = client.post(
@@ -630,12 +589,7 @@ def test_chat_completions_image_reaches_sdk_as_base64_block():
                         "role": "user",
                         "content": [
                             {"type": "text", "text": "what's this?"},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": "data:image/jpeg;base64,/9j/ABC"
-                                },
-                            },
+                            _image_url_part("data:image/jpeg;base64,/9j/ABC"),
                         ],
                     }
                 ],
@@ -661,7 +615,7 @@ def test_chat_completions_image_reaches_sdk_as_base64_block():
 
 def test_chat_completions_image_reaches_sdk_as_url_block():
     """HTTP URL の image_url を投げたとき、SDK に url source の image block が届くこと。"""
-    query_fn, calls = _make_capturing_query_fn(["described"])
+    query_fn, calls = _make_query_fn(["described"])
     with _patch_sdk(query_fn):
         client = TestClient(app)
         r = client.post(
@@ -671,12 +625,7 @@ def test_chat_completions_image_reaches_sdk_as_url_block():
                 "messages": [
                     {
                         "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": "https://example.com/x.png"},
-                            }
-                        ],
+                        "content": [_image_url_part("https://example.com/x.png")],
                     }
                 ],
             },
@@ -691,7 +640,7 @@ def test_chat_completions_image_reaches_sdk_as_url_block():
 
 def test_chat_completions_multiple_images_reach_sdk_in_order():
     """複数画像が順番通りに SDK まで届くこと。"""
-    query_fn, calls = _make_capturing_query_fn(["ok"])
+    query_fn, calls = _make_query_fn(["ok"])
     with _patch_sdk(query_fn):
         client = TestClient(app)
         r = client.post(
@@ -703,18 +652,8 @@ def test_chat_completions_multiple_images_reach_sdk_in_order():
                         "role": "user",
                         "content": [
                             {"type": "text", "text": "compare"},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": "data:image/png;base64,AAA"
-                                },
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": "data:image/png;base64,BBB"
-                                },
-                            },
+                            _image_url_part("data:image/png;base64,AAA"),
+                            _image_url_part("data:image/png;base64,BBB"),
                         ],
                     }
                 ],
@@ -731,7 +670,7 @@ def test_chat_completions_multiple_images_reach_sdk_in_order():
 
 def test_chat_completions_text_only_stays_string_prompt():
     """画像なしリクエストでは prompt が str のまま（回帰防止）。"""
-    query_fn, calls = _make_capturing_query_fn(["hi"])
+    query_fn, calls = _make_query_fn(["hi"])
     with _patch_sdk(query_fn):
         client = TestClient(app)
         r = client.post(
