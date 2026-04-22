@@ -64,6 +64,20 @@ logger = logging.getLogger("claude-proxy")
 _CLAUDE_QUERY_MAX_ATTEMPTS = 2
 _CLAUDE_RETRY_BASE_DELAY_SEC = 0.25
 
+# Claude Code CLI サブプロセスの同時起動数上限。
+# リクエストごとに 1 サブプロセス立つため、無制限だと macOS の fd 上限
+# (ulimit -n) を食い潰して EMFILE / "Too many open files" で失敗する。
+_SDK_CONCURRENCY = int(os.getenv("CAS_MAX_CONCURRENT_QUERIES", "8"))
+_sdk_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_sdk_semaphore() -> asyncio.Semaphore:
+    """SDK サブプロセス起動を直列化する Semaphore（event loop 立ち上がり後に遅延生成）。"""
+    global _sdk_semaphore
+    if _sdk_semaphore is None:
+        _sdk_semaphore = asyncio.Semaphore(_SDK_CONCURRENCY)
+    return _sdk_semaphore
+
 # ---------------------------------------------------------------------------
 # OpenAI 互換の型定義
 # ---------------------------------------------------------------------------
@@ -472,35 +486,36 @@ async def call_claude(req: ChatCompletionRequest) -> str:
     system_prompt, content_blocks = convert_messages(req.messages)
     options = _make_options(req.model, system_prompt)
 
-    last_error: Exception | None = None
-    for attempt in range(1, _CLAUDE_QUERY_MAX_ATTEMPTS + 1):
-        text_parts: list[str] = []
-        # AsyncIterable プロンプトは 1 回で消費されるため、再試行ごとに作り直す。
-        prompt = await _make_prompt(content_blocks)
-        try:
-            async for message in query(prompt=prompt, options=options):
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            text_parts.append(block.text)
-            return "\n".join(text_parts) if text_parts else ""
-        except Exception as exc:
-            last_error = exc
-            if attempt < _CLAUDE_QUERY_MAX_ATTEMPTS and _is_retryable_claude_error(exc):
-                logger.warning(
-                    "Claude query failed on attempt %s/%s; retrying. error=%s",
-                    attempt,
-                    _CLAUDE_QUERY_MAX_ATTEMPTS,
-                    _compact_exception_text(exc),
-                )
-                await asyncio.sleep(_CLAUDE_RETRY_BASE_DELAY_SEC * attempt)
-                continue
-            logger.exception("Claude query failed")
-            raise _to_claude_proxy_error(exc) from exc
+    async with _get_sdk_semaphore():
+        last_error: Exception | None = None
+        for attempt in range(1, _CLAUDE_QUERY_MAX_ATTEMPTS + 1):
+            text_parts: list[str] = []
+            # AsyncIterable プロンプトは 1 回で消費されるため、再試行ごとに作り直す。
+            prompt = await _make_prompt(content_blocks)
+            try:
+                async for message in query(prompt=prompt, options=options):
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                text_parts.append(block.text)
+                return "\n".join(text_parts) if text_parts else ""
+            except Exception as exc:
+                last_error = exc
+                if attempt < _CLAUDE_QUERY_MAX_ATTEMPTS and _is_retryable_claude_error(exc):
+                    logger.warning(
+                        "Claude query failed on attempt %s/%s; retrying. error=%s",
+                        attempt,
+                        _CLAUDE_QUERY_MAX_ATTEMPTS,
+                        _compact_exception_text(exc),
+                    )
+                    await asyncio.sleep(_CLAUDE_RETRY_BASE_DELAY_SEC * attempt)
+                    continue
+                logger.exception("Claude query failed")
+                raise _to_claude_proxy_error(exc) from exc
 
-    if last_error is not None:
-        raise _to_claude_proxy_error(last_error) from last_error
-    return ""
+        if last_error is not None:
+            raise _to_claude_proxy_error(last_error) from last_error
+        return ""
 
 
 def _emit_assistant_text_chunks(
@@ -529,6 +544,9 @@ async def stream_claude(req: ChatCompletionRequest):
     を一時失敗のリトライ対象とする。最初の message を取得した後は真のストリーミングに
     切り替わり、途中で失敗した場合は error chunk を 1 度 yield して終了する
     （既に送ったトークンは巻き戻せないため）。
+
+    サブプロセスが生きている間は Semaphore を保持し続けるため、`async with` は
+    iteration の終端まで囲む必要がある（途中で release すると fd リークの原因になる）。
     """
     from claude_agent_sdk import query
 
@@ -537,66 +555,67 @@ async def stream_claude(req: ChatCompletionRequest):
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
-    # --- Phase 1: 初回接続〜最初の SDK message までのリトライ ---
-    stream_iter = None
-    first_message: Any = None
-    has_first = False
-    last_error: Exception | None = None
+    async with _get_sdk_semaphore():
+        # --- Phase 1: 初回接続〜最初の SDK message までのリトライ ---
+        stream_iter = None
+        first_message: Any = None
+        has_first = False
+        last_error: Exception | None = None
 
-    for attempt in range(1, _CLAUDE_QUERY_MAX_ATTEMPTS + 1):
-        try:
-            prompt = await _make_prompt(content_blocks)
-            iterator = query(prompt=prompt, options=options).__aiter__()
+        for attempt in range(1, _CLAUDE_QUERY_MAX_ATTEMPTS + 1):
             try:
-                first_message = await iterator.__anext__()
-                has_first = True
-            except StopAsyncIteration:
-                # 空応答（message が一つも来ない）も成功扱いにする
-                has_first = False
-            stream_iter = iterator
-            break
-        except Exception as exc:
-            last_error = exc
-            if attempt < _CLAUDE_QUERY_MAX_ATTEMPTS and _is_retryable_claude_error(exc):
-                logger.warning(
-                    "Claude streaming query failed on attempt %s/%s; retrying. error=%s",
-                    attempt,
-                    _CLAUDE_QUERY_MAX_ATTEMPTS,
-                    _compact_exception_text(exc),
-                )
-                await asyncio.sleep(_CLAUDE_RETRY_BASE_DELAY_SEC * attempt)
-                continue
-            logger.exception("Claude streaming query failed")
-            proxy_error = _to_claude_proxy_error(exc)
+                prompt = await _make_prompt(content_blocks)
+                iterator = query(prompt=prompt, options=options).__aiter__()
+                try:
+                    first_message = await iterator.__anext__()
+                    has_first = True
+                except StopAsyncIteration:
+                    # 空応答（message が一つも来ない）も成功扱いにする
+                    has_first = False
+                stream_iter = iterator
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt < _CLAUDE_QUERY_MAX_ATTEMPTS and _is_retryable_claude_error(exc):
+                    logger.warning(
+                        "Claude streaming query failed on attempt %s/%s; retrying. error=%s",
+                        attempt,
+                        _CLAUDE_QUERY_MAX_ATTEMPTS,
+                        _compact_exception_text(exc),
+                    )
+                    await asyncio.sleep(_CLAUDE_RETRY_BASE_DELAY_SEC * attempt)
+                    continue
+                logger.exception("Claude streaming query failed")
+                proxy_error = _to_claude_proxy_error(exc)
+                yield f"data: {json.dumps(proxy_error.to_openai_error())}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+        if stream_iter is None:
+            proxy_error = _to_claude_proxy_error(last_error or RuntimeError("unknown"))
             yield f"data: {json.dumps(proxy_error.to_openai_error())}\n\n"
             yield "data: [DONE]\n\n"
             return
 
-    if stream_iter is None:
-        proxy_error = _to_claude_proxy_error(last_error or RuntimeError("unknown"))
-        yield f"data: {json.dumps(proxy_error.to_openai_error())}\n\n"
-        yield "data: [DONE]\n\n"
-        return
-
-    # --- Phase 2: 実ストリーム。途中失敗はエラーチャンクで打ち切り ---
-    yield _sse_chunk(completion_id, created, req.model, {"role": "assistant", "content": ""}, None)
-    try:
-        if has_first:
-            for chunk in _emit_assistant_text_chunks(
-                first_message, completion_id, created, req.model
-            ):
-                yield chunk
-        async for message in stream_iter:
-            for chunk in _emit_assistant_text_chunks(
-                message, completion_id, created, req.model
-            ):
-                yield chunk
-    except Exception as exc:
-        logger.exception("Claude streaming mid-stream failure")
-        proxy_error = _to_claude_proxy_error(exc)
-        yield f"data: {json.dumps(proxy_error.to_openai_error())}\n\n"
-        yield "data: [DONE]\n\n"
-        return
+        # --- Phase 2: 実ストリーム。途中失敗はエラーチャンクで打ち切り ---
+        yield _sse_chunk(completion_id, created, req.model, {"role": "assistant", "content": ""}, None)
+        try:
+            if has_first:
+                for chunk in _emit_assistant_text_chunks(
+                    first_message, completion_id, created, req.model
+                ):
+                    yield chunk
+            async for message in stream_iter:
+                for chunk in _emit_assistant_text_chunks(
+                    message, completion_id, created, req.model
+                ):
+                    yield chunk
+        except Exception as exc:
+            logger.exception("Claude streaming mid-stream failure")
+            proxy_error = _to_claude_proxy_error(exc)
+            yield f"data: {json.dumps(proxy_error.to_openai_error())}\n\n"
+            yield "data: [DONE]\n\n"
+            return
 
     yield _sse_chunk(completion_id, created, req.model, {}, "stop")
     yield "data: [DONE]\n\n"
@@ -653,7 +672,7 @@ async def _fetch_models() -> list[dict[str, Any]]:
         from claude_agent_sdk import ClaudeSDKClient
 
         try:
-            async with ClaudeSDKClient() as client:
+            async with _get_sdk_semaphore(), ClaudeSDKClient() as client:
                 info = await client.get_server_info()
                 if info and "models" in info:
                     _cached_models = info["models"]
