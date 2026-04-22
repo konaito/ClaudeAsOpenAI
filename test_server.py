@@ -45,9 +45,21 @@ from server import (
 )
 
 
+def _image_url_part(url: str) -> dict:
+    """OpenAI 互換の image_url content part を組み立てる。"""
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
 # ---------------------------------------------------------------------------
 # convert_messages
 # ---------------------------------------------------------------------------
+
+
+def _sole_text(blocks: list[dict]) -> str:
+    """1 件の text block のみの想定で text を取り出す。"""
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "text"
+    return blocks[0]["text"]
 
 
 def test_convert_messages_basic():
@@ -59,9 +71,10 @@ def test_convert_messages_basic():
     ]
     sysp, userp = convert_messages(msgs)
     assert sysp == "sys1"
-    assert "User: hi" in userp
-    assert "Assistant: hello" in userp
-    assert "User: how are you?" in userp
+    text = _sole_text(userp)
+    assert "User: hi" in text
+    assert "Assistant: hello" in text
+    assert "User: how are you?" in text
 
 
 def test_convert_messages_multiple_systems_joined():
@@ -72,14 +85,14 @@ def test_convert_messages_multiple_systems_joined():
     ]
     sysp, userp = convert_messages(msgs)
     assert sysp == "a\n\nb"
-    assert userp == "User: q"
+    assert _sole_text(userp) == "User: q"
 
 
 def test_convert_messages_empty_user_fallback():
     msgs = [ChatMessage(role="system", content="only system")]
     sysp, userp = convert_messages(msgs)
     assert sysp == "only system"
-    assert userp == "Hello"
+    assert _sole_text(userp) == "Hello"
 
 
 def test_convert_messages_multimodal_text_part():
@@ -91,7 +104,7 @@ def test_convert_messages_multimodal_text_part():
     ]
     sysp, userp = convert_messages(msgs)
     assert sysp is None
-    assert "what is this?" in userp
+    assert "what is this?" in _sole_text(userp)
 
 
 def test_convert_messages_image_produces_blocks():
@@ -100,12 +113,7 @@ def test_convert_messages_image_produces_blocks():
             role="user",
             content=[
                 {"type": "text", "text": "describe"},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": "data:image/png;base64,AAAA"
-                    },
-                },
+                _image_url_part("data:image/png;base64,AAAA"),
             ],
         )
     ]
@@ -125,12 +133,7 @@ def test_convert_messages_image_url_http():
     msgs = [
         ChatMessage(
             role="user",
-            content=[
-                {
-                    "type": "image_url",
-                    "image_url": {"url": "https://example.com/x.png"},
-                }
-            ],
+            content=[_image_url_part("https://example.com/x.png")],
         )
     ]
     _, userp = convert_messages(msgs)
@@ -144,18 +147,99 @@ def test_convert_image_url_invalid_returns_none():
     assert _convert_image_url_to_claude({"image_url": {"url": "data:broken"}}) is None
 
 
+def test_convert_messages_multiple_images_preserved():
+    msgs = [
+        ChatMessage(
+            role="user",
+            content=[
+                {"type": "text", "text": "compare"},
+                _image_url_part("data:image/png;base64,AAA"),
+                _image_url_part("https://example.com/b.png"),
+            ],
+        )
+    ]
+    _, userp = convert_messages(msgs)
+    assert isinstance(userp, list)
+    # 先頭に text、続いて image を順番通り
+    assert userp[0]["type"] == "text"
+    images = [b for b in userp if b["type"] == "image"]
+    assert len(images) == 2
+    assert images[0]["source"]["type"] == "base64"
+    assert images[0]["source"]["data"] == "AAA"
+    assert images[1]["source"]["type"] == "url"
+    assert images[1]["source"]["url"] == "https://example.com/b.png"
+
+
+def test_convert_messages_image_in_assistant_role_ignored():
+    msgs = [
+        ChatMessage(
+            role="user",
+            content=[{"type": "text", "text": "look"}],
+        ),
+        ChatMessage(
+            role="assistant",
+            content=[
+                {"type": "text", "text": "ok"},
+                _image_url_part("data:image/png;base64,AAA"),
+            ],
+        ),
+    ]
+    _, userp = convert_messages(msgs)
+    # 画像が assistant にしかなければ image block は作られず、text 1 件のみ
+    text = _sole_text(userp)
+    assert "User: look" in text
+    assert "Assistant: ok" in text
+
+
+def test_convert_messages_images_across_multiple_user_messages():
+    msgs = [
+        ChatMessage(
+            role="user",
+            content=[
+                {"type": "text", "text": "first"},
+                _image_url_part("data:image/png;base64,AAA"),
+            ],
+        ),
+        ChatMessage(role="assistant", content="got it"),
+        ChatMessage(
+            role="user",
+            content=[
+                {"type": "text", "text": "second"},
+                _image_url_part("data:image/png;base64,BBB"),
+            ],
+        ),
+    ]
+    _, userp = convert_messages(msgs)
+    assert isinstance(userp, list)
+    images = [b for b in userp if b["type"] == "image"]
+    assert len(images) == 2
+    assert images[0]["source"]["data"] == "AAA"
+    assert images[1]["source"]["data"] == "BBB"
+    text_blocks = [b for b in userp if b["type"] == "text"]
+    assert len(text_blocks) == 1
+    joined = text_blocks[0]["text"]
+    assert "User: first" in joined
+    assert "Assistant: got it" in joined
+    assert "User: second" in joined
+
+
 # ---------------------------------------------------------------------------
 # _make_prompt
 # ---------------------------------------------------------------------------
 
 
-def test_make_prompt_string_passthrough():
-    result = asyncio.run(_make_prompt("hello"))
+def test_make_prompt_single_text_block_returns_str():
+    """text block 1 件のみなら str 経路に寄せる。"""
+    result = asyncio.run(_make_prompt([{"type": "text", "text": "hello"}]))
     assert result == "hello"
 
 
-def test_make_prompt_list_returns_async_iterator():
-    blocks = [{"type": "text", "text": "x"}]
+def test_make_prompt_multi_block_returns_async_iterator():
+    """image を含む場合など複数 block は AsyncIterable 経路。"""
+    blocks = [
+        {"type": "text", "text": "look"},
+        {"type": "image", "source": {"type": "url", "url": "x"}},
+    ]
 
     async def _collect():
         stream = await _make_prompt(blocks)
@@ -169,6 +253,19 @@ def test_make_prompt_list_returns_async_iterator():
     msg = items[0]
     assert msg["type"] == "user"
     assert msg["message"]["content"] == blocks
+
+
+def test_make_prompt_non_text_single_block_returns_async_iterator():
+    """text 以外の block 1 件なら AsyncIterable（str に丸められない）。"""
+    blocks = [{"type": "image", "source": {"type": "url", "url": "x"}}]
+
+    async def _collect():
+        stream = await _make_prompt(blocks)
+        return [item async for item in stream]
+
+    items = asyncio.run(_collect())
+    assert len(items) == 1
+    assert items[0]["message"]["content"] == blocks
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +309,7 @@ def test_compact_exception_text_empty_fallback():
         ("Command failed with exit code 1", True),
         ("cannot write to process that exited", True),
         ("Broken pipe", True),
+        ("Control request timeout: initialize", True),
         ("some other error", False),
     ],
 )
@@ -230,6 +328,12 @@ def test_to_claude_proxy_error_process_failed_via_text():
     err = _to_claude_proxy_error(Exception("Command failed with exit code 2"))
     assert err.status_code == 502
     assert err.code == "claude_cli_process_failed"
+
+
+def test_to_claude_proxy_error_initialize_timeout():
+    err = _to_claude_proxy_error(Exception("Control request timeout: initialize"))
+    assert err.status_code == 503
+    assert err.code == "claude_backend_initialize_timeout"
 
 
 def test_claude_proxy_error_to_openai_shape():
@@ -254,8 +358,13 @@ class _FakeTextBlock:
 
 
 def _make_query_fn(outputs):
-    """outputs: list of either str (成功テキスト) or Exception (投げる)。"""
-    calls = {"n": 0}
+    """outputs: list of either str (成功テキスト) or Exception (投げる)。
+
+    calls["n"]       -- query() が呼ばれた回数
+    calls["prompts"] -- query() に渡された prompt。
+                        AsyncIterable の場合は消費して list として保存する。
+    """
+    calls = {"n": 0, "prompts": []}
 
     def _query(prompt, options):  # noqa: ARG001
         idx = calls["n"]
@@ -263,6 +372,14 @@ def _make_query_fn(outputs):
         item = outputs[idx]
 
         async def _gen():
+            if isinstance(prompt, str):
+                calls["prompts"].append(prompt)
+            else:
+                collected = []
+                async for msg in prompt:
+                    collected.append(msg)
+                calls["prompts"].append(collected)
+
             if isinstance(item, Exception):
                 raise item
             yield _FakeAssistantMessage(item)
@@ -300,6 +417,19 @@ def test_call_claude_success():
 def test_call_claude_retries_on_retryable():
     query_fn, calls = _make_query_fn(
         [Exception("Command failed with exit code 1"), "recovered"]
+    )
+    with _patch_sdk(query_fn), patch("server.asyncio.sleep", new=_async_noop):
+        req = ChatCompletionRequest(
+            model="sonnet", messages=[ChatMessage(role="user", content="hi")]
+        )
+        text = asyncio.run(call_claude(req))
+    assert text == "recovered"
+    assert calls["n"] == 2
+
+
+def test_call_claude_retries_on_initialize_timeout():
+    query_fn, calls = _make_query_fn(
+        [Exception("Control request timeout: initialize"), "recovered"]
     )
     with _patch_sdk(query_fn), patch("server.asyncio.sleep", new=_async_noop):
         req = ChatCompletionRequest(
@@ -390,6 +520,105 @@ def test_stream_claude_emits_error_payload():
     assert payload["error"]["code"] == "claude_backend_failed"
 
 
+def test_stream_claude_with_image_passes_blocks_to_sdk():
+    query_fn, calls = _make_query_fn(["streamed"])
+
+    async def _collect():
+        req = ChatCompletionRequest(
+            model="sonnet",
+            messages=[
+                ChatMessage(
+                    role="user",
+                    content=[
+                        {"type": "text", "text": "what's this?"},
+                        _image_url_part("data:image/png;base64,AAA"),
+                    ],
+                )
+            ],
+            stream=True,
+        )
+        return [c async for c in stream_claude(req)]
+
+    with _patch_sdk(query_fn):
+        chunks = asyncio.run(_collect())
+
+    assert chunks[-1] == "data: [DONE]\n\n"
+    assert any("streamed" in c for c in chunks)
+
+    # SDK に image block が届いたことを確認
+    captured = calls["prompts"][0]
+    assert isinstance(captured, list)
+    content = captured[0]["message"]["content"]
+    assert any(b["type"] == "image" for b in content)
+
+
+def test_stream_claude_retries_on_retryable_error_before_first_yield():
+    """初回 query() の接続失敗が retryable なら、2 回目で成功して通常ストリームを返す。
+
+    call_claude と同等のリトライ経路が stream_claude にも存在することの検証。
+    """
+    query_fn, calls = _make_query_fn(
+        [Exception("Command failed with exit code 1"), "recovered"]
+    )
+
+    async def _collect():
+        req = ChatCompletionRequest(
+            model="sonnet",
+            messages=[ChatMessage(role="user", content="hi")],
+            stream=True,
+        )
+        return [c async for c in stream_claude(req)]
+
+    with _patch_sdk(query_fn), patch("server.asyncio.sleep", new=_async_noop):
+        chunks = asyncio.run(_collect())
+
+    assert calls["n"] == 2
+    assert any("recovered" in c for c in chunks)
+    assert chunks[-1] == "data: [DONE]\n\n"
+    # エラーチャンクは出ていないこと
+    assert not any('"error"' in c for c in chunks)
+
+
+def test_stream_claude_retries_on_initialize_timeout():
+    """initialize timeout も yield 前なのでリトライされる。"""
+    query_fn, calls = _make_query_fn(
+        [Exception("Control request timeout: initialize"), "recovered"]
+    )
+
+    async def _collect():
+        req = ChatCompletionRequest(
+            model="sonnet",
+            messages=[ChatMessage(role="user", content="hi")],
+            stream=True,
+        )
+        return [c async for c in stream_claude(req)]
+
+    with _patch_sdk(query_fn), patch("server.asyncio.sleep", new=_async_noop):
+        chunks = asyncio.run(_collect())
+
+    assert calls["n"] == 2
+    assert any("recovered" in c for c in chunks)
+
+
+def test_stream_claude_no_retry_on_non_retryable_error():
+    """non-retryable エラー（RuntimeError 等）はリトライせず即エラーチャンク。"""
+    query_fn, calls = _make_query_fn([RuntimeError("boom")])
+
+    async def _collect():
+        req = ChatCompletionRequest(
+            model="sonnet",
+            messages=[ChatMessage(role="user", content="hi")],
+            stream=True,
+        )
+        return [c async for c in stream_claude(req)]
+
+    with _patch_sdk(query_fn):
+        chunks = asyncio.run(_collect())
+
+    assert calls["n"] == 1
+    assert any('"error"' in c for c in chunks)
+
+
 # ---------------------------------------------------------------------------
 # FastAPI エンドポイント
 # ---------------------------------------------------------------------------
@@ -437,6 +666,117 @@ def test_chat_completions_error_maps_to_status():
         )
     assert r.status_code == 502
     assert r.json()["error"]["code"] == "claude_cli_process_failed"
+
+
+def test_chat_completions_image_reaches_sdk_as_base64_block():
+    """OpenAI image_url (data URL) を投げたとき、SDK に base64 image block が届くこと。"""
+    query_fn, calls = _make_query_fn(["described"])
+    with _patch_sdk(query_fn):
+        client = TestClient(app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "sonnet",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "what's this?"},
+                            _image_url_part("data:image/jpeg;base64,/9j/ABC"),
+                        ],
+                    }
+                ],
+            },
+        )
+    assert r.status_code == 200
+    assert r.json()["choices"][0]["message"]["content"] == "described"
+
+    captured = calls["prompts"][0]
+    assert isinstance(captured, list), "画像があるとき AsyncIterable で送られる"
+    assert len(captured) == 1
+    msg = captured[0]
+    assert msg["type"] == "user"
+    content = msg["message"]["content"]
+    assert isinstance(content, list)
+    img = next(b for b in content if b["type"] == "image")
+    assert img["source"] == {
+        "type": "base64",
+        "media_type": "image/jpeg",
+        "data": "/9j/ABC",
+    }
+
+
+def test_chat_completions_image_reaches_sdk_as_url_block():
+    """HTTP URL の image_url を投げたとき、SDK に url source の image block が届くこと。"""
+    query_fn, calls = _make_query_fn(["described"])
+    with _patch_sdk(query_fn):
+        client = TestClient(app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "sonnet",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [_image_url_part("https://example.com/x.png")],
+                    }
+                ],
+            },
+        )
+    assert r.status_code == 200
+    captured = calls["prompts"][0]
+    assert isinstance(captured, list)
+    content = captured[0]["message"]["content"]
+    img = next(b for b in content if b["type"] == "image")
+    assert img["source"] == {"type": "url", "url": "https://example.com/x.png"}
+
+
+def test_chat_completions_multiple_images_reach_sdk_in_order():
+    """複数画像が順番通りに SDK まで届くこと。"""
+    query_fn, calls = _make_query_fn(["ok"])
+    with _patch_sdk(query_fn):
+        client = TestClient(app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "sonnet",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "compare"},
+                            _image_url_part("data:image/png;base64,AAA"),
+                            _image_url_part("data:image/png;base64,BBB"),
+                        ],
+                    }
+                ],
+            },
+        )
+    assert r.status_code == 200
+    captured = calls["prompts"][0]
+    content = captured[0]["message"]["content"]
+    images = [b for b in content if b["type"] == "image"]
+    assert len(images) == 2
+    assert images[0]["source"]["data"] == "AAA"
+    assert images[1]["source"]["data"] == "BBB"
+
+
+def test_chat_completions_text_only_stays_string_prompt():
+    """画像なしリクエストでは prompt が str のまま（回帰防止）。"""
+    query_fn, calls = _make_query_fn(["hi"])
+    with _patch_sdk(query_fn):
+        client = TestClient(app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "sonnet",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+    assert r.status_code == 200
+    captured = calls["prompts"][0]
+    assert isinstance(captured, str), "テキストのみなら str で SDK に渡すべき"
+    assert "User: hello" in captured
 
 
 def test_models_cache_clear():
