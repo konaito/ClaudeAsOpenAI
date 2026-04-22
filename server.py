@@ -20,6 +20,20 @@ Claude モデルにアクセスできるプロキシサーバー。
 
     # Swagger UI
     http://localhost:8000/docs
+
+画像入力:
+    OpenAI の image_url 形式（data URL / HTTP URL）に対応。
+    user ロールの content 配列に image_url パートを混ぜるだけで、
+    Claude の image content block に変換されて渡される。
+
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "これは何？"},
+            {"type": "image_url",
+             "image_url": {"url": "data:image/jpeg;base64,/9j/..."}},
+        ],
+    }]
 """
 
 # /// script
@@ -67,7 +81,8 @@ class ChatMessage(BaseModel):
         None,
         description=(
             "メッセージ本文。文字列またはマルチモーダル content parts の配列。"
-            "マルチモーダルの場合、text タイプの部分のみ処理される。"
+            "配列では `text` と `image_url`（user ロールのみ）パートをサポート。"
+            "`image_url` は data URL（base64）と HTTP URL の両方に対応。"
         ),
         json_schema_extra={"examples": ["Hello, how are you?"]},
     )
@@ -261,8 +276,14 @@ def _is_retryable_claude_error(exc: Exception) -> bool:
         "command failed with exit code",
         "cannot write to process that exited",
         "broken pipe",
+        "control request timeout: initialize",
     )
     return any(marker in message for marker in retry_markers)
+
+
+def _is_initialize_timeout_error(exc: Exception) -> bool:
+    """Claude 初期化フェーズのタイムアウトかを判定。"""
+    return "control request timeout: initialize" in str(exc).lower()
 
 
 def _to_claude_proxy_error(exc: Exception) -> ClaudeProxyError:
@@ -284,6 +305,17 @@ def _to_claude_proxy_error(exc: Exception) -> ClaudeProxyError:
             message=f"Failed to connect to Claude Code CLI.\n{detail}",
             error_type="service_unavailable",
             code="claude_cli_connection_failed",
+        )
+    if _is_initialize_timeout_error(exc):
+        return ClaudeProxyError(
+            status_code=503,
+            message=(
+                "Claude backend initialize request timed out. "
+                "Please retry after a short delay.\n"
+                f"{detail}"
+            ),
+            error_type="service_unavailable",
+            code="claude_backend_initialize_timeout",
         )
     if isinstance(exc, ProcessError) or "command failed with exit code" in detail.lower():
         return ClaudeProxyError(
@@ -439,11 +471,12 @@ async def call_claude(req: ChatCompletionRequest) -> str:
 
     system_prompt, user_prompt = convert_messages(req.messages)
     options = _make_options(req.model, system_prompt)
-    prompt = await _make_prompt(user_prompt)
 
     last_error: Exception | None = None
     for attempt in range(1, _CLAUDE_QUERY_MAX_ATTEMPTS + 1):
         text_parts: list[str] = []
+        # AsyncIterable プロンプトは 1 回で消費されるため、再試行ごとに作り直す。
+        prompt = await _make_prompt(user_prompt)
         try:
             async for message in query(prompt=prompt, options=options):
                 if isinstance(message, AssistantMessage):
@@ -560,6 +593,7 @@ app = FastAPI(
         "- OpenAI SDK / curl からそのまま使える\n"
         "- model 名は Claude Code CLI にそのまま渡される（マッピングなし）\n"
         "- ストリーミング (SSE) 対応\n"
+        "- 画像入力対応（OpenAI `image_url` 形式: data URL / HTTP URL）\n"
         "- セッション管理不要（毎回ワンショット）\n"
         "- モデル一覧は CLI から動的に取得\n\n"
         "## クイックスタート\n"
@@ -580,6 +614,18 @@ app = FastAPI(
         '    messages=[{"role": "user", "content": "Hello"}]\n'
         ")\n"
         "print(r.choices[0].message.content)\n"
+        "```\n\n"
+        "## 画像入力\n"
+        "`content` を配列にして `image_url` パートを混ぜる。画像は `user` ロールでのみ有効。\n"
+        "```python\n"
+        "messages=[{\n"
+        '    "role": "user",\n'
+        '    "content": [\n'
+        '        {"type": "text", "text": "これは何？"},\n'
+        '        {"type": "image_url",\n'
+        '         "image_url": {"url": "data:image/jpeg;base64,/9j/..."}},\n'
+        "    ],\n"
+        "}]\n"
         "```\n\n"
         "## 利用可能モデル\n"
         "GET `/v1/models` で Claude Code CLI が提供するモデル一覧を取得できる。\n"
